@@ -229,6 +229,11 @@ class RLVRConfig(BaseConfig):
     difficulty_high_threshold: float = field(default=1.0)
     error_max_len_clip: bool = field(default=False)
     error_max_len_threshold: int = field(default=9999999999)
+    use_filtering_metric: bool = field(default=False, metadata={"help": "Apply reward metric for prompt filtering."})
+    filtering_metric: str = field(default=None, metadata={"help": "Prompt filtering metric."})
+    num_recent_reward: int = field(default=0, metadta={"help": "Number of recent rewards applied for prompt filtering."})
+    filtering_warmup_epoch: int = field(default=0, metadata={"help": "Minimal epoch that starts to apply prompt filtering."})
+    filtering_max_epoch: int = field(default=0, metadata={"help": "Maximal epoch that applys prompt filtering."})
 
     def __post_init__(self):
         super().__post_init__()

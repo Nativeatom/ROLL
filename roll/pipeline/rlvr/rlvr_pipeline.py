@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 import datasets
 import ray
 import torch
+import numpy as np
 from codetiming import Timer
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.util.timer import _Timer
@@ -309,6 +310,27 @@ class RLVRPipeline(BasePipeline):
         for domain in self.rewards.keys():
             self.running[domain] = RunningMoments()
 
+    def dataset_info_init(self):
+        self.history_metrics_per_domain_dataset = {}
+        self.prompt_reward_by_step = {}
+        self.data_vol = {}
+        for domain in self.domain_datasets:
+            self.history_metrics_per_domain_dataset[domain] = {
+                "latest_avg_reward": [],
+                "num_prompts": []
+            }
+            self.data_vol[domain] = len(self.domain_datasets[domain])
+        self.step_per_ep = math.ceil(sum(self.data_vol.values()) / self.pipeline_config.rollout_batch_size)
+        self.data_vol_init = self.data_vol.copy()
+        self.data_vol_total_init = sum(self.data_vol_init.values())
+        self.data_idx_filter_total = {}
+
+        for domain in self.domain_datasets:
+            self.data_idx_filter_total[domain] = []
+        
+        self.num_prompts = dict([(domain, 0) for domain in self.domain_datasets])
+        self.total_data_vol = sum(self.data_vol.values())
+
     @torch.no_grad()
     def run(self):
         # 计算tokens per second 系统吞吐
@@ -321,11 +343,69 @@ class RLVRPipeline(BasePipeline):
         actor_infer_response_timer = _Timer(window_size=5)
         actor_train_timer = _Timer(window_size=5)
 
+        self.dataset_info_init()
+        epoch, ep_step_accum = 0, 0
+
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
                 global_step += 1
                 continue
             logger.info(f"pipeline step {global_step} start...")
+
+            if ep_step_accum == self.step_per_ep:
+                epoch += 1
+                ep_step_accum = 0
+                
+                if len(self.prompt_reward_by_step) == self.data_vol_total_init:
+                    self.total_data_vol_updated = 0
+                    for domain in self.domain_datasets:
+                        self.history_metrics_per_domain_dataset[domain]["num_prompts"].append(self.num_prompts[domain])
+                        ep_reward = len(self.history_metrics_per_domain_dataset[domain]["latest_avg_reward"])
+                        domain_avg_reward = np.mean([v["history"][ep_reward]["pass_rate"] for k, v in self.prompt_reward_by_step.items() if 
+                                                     k.startswith(domain) and len(v["history"]) > ep_reward])
+                        if self.pipeline_config.use_filtering_metric and epoch >= self.pipeline_config.filtering_warmup_epoch and epoch < self.pipeline_config.filtering_max_epoch:
+                            if self.pipeline_config.filtering_metric == "mean_temporal_reward":
+                                domain_idx_to_filter = [idx for idx, reward in self.prompt_reward_by_step.items() if len(reward["history"]) >= self.pipeline_config.filtering_warmup_epoch
+                                                        and sum([x["pass_rate"] for x in reward["history"][-self.pipeline_config.num_recent_reward:]]) == 1]
+                                self.data_idx_filter_total[domain] += [idx.split("|")[1] for idx in domain_idx_to_filter]
+                        self.history_metrics_per_domain_dataset[domain]["latest_avg_reward"].append(domain_avg_reward)
+
+                        if len(self.data_idx_filter_total[domain]):
+                            domain_dataset_filtered = self.domain_datasets[domain].filter(lambda data_i: data_i["id"] not in self.data_idx_filter_total[domain])
+                            logger.info("{} filtered step {}: {}".format(domain, global_step, len(domain_dataset_filtered)))
+                            domain_filter_generate_scheduler = DynamicSamplingScheduler.options(
+                                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                                        node_id=ray.get_runtime_context().get_node_id(),
+                                        soft=False,
+                                    )
+                                ).remote(pipeline_config=self.pipeline_config)
+                            ray.get(
+                                domain_filter_generate_scheduler.set_scheduler.remote(
+                                    actor_cluster=self.actor_infer,
+                                    reward_clusters={domain: self.rewards[domain]},
+                                    dataset=domain_dataset_filtered,
+                                    collect_fn_cls=DataCollatorWithPaddingForPaddedKeys,
+                                    collect_fn_kwargs=dict(max_length=self.pipeline_config.prompt_length, padding="max_length"),
+                                    response_filter_fn=lambda data_item, config: True,
+                                    query_filter_fn=query_filter_fn,
+                                    response_callback_fn=domain_filter_generate_scheduler.report_response.remote,
+                                    state=self.state.kv.get(f"scheduler_state_{domain}", None),
+                                )
+                            )
+
+                            # update domain batch size
+                            self.generate_schedulers[domain] = domain_filter_generate_scheduler
+                            self.domain_batch_size[domain] = min(self.domain_batch_size[domain], len(domain_dataset_filtered))
+
+                            self.total_data_vol_updated += len(domain_dataset_filtered)
+                        else:
+                            self.total_data_vol_updated += len(self.domain_datasets[domain])
+                                
+                    # update step consists in one epoch
+                    self.total_data_vol = self.total_data_vol_updated
+                    self.step_per_ep = math.ceil(self.total_data_vol / self.pipeline_config.rollout_batch_size)
+
+                self.num_prompts = dict([(domain, 0) for domain in self.domain_datasets])
 
             metrics_mgr.clear_metrics()
             with tps_timer, Timer(name="step_total", logger=None) as step_total_timer:
@@ -369,6 +449,28 @@ class RLVRPipeline(BasePipeline):
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
                         domain_batches[domain] = domain_batch
+
+                        domain_batch_ids = domain_batch.non_tensor_batch["id"]
+                        domain_batch_scores = domain_batch.batch["scores"]
+
+                        domain_id2rewards = {}
+                        for domain_id, domain_prompt_score in zip(domain_batch_ids, domain_batch_scores):
+                            domain_id_key = "{}|{}".format(domain, domain_id)
+                            if domain_id_key not in self.prompt_reward_by_step:
+                                self.prompt_reward_by_step[domain_id_key] = {"history": [], "meta_metric": []}
+                            if domain_id_key not in domain_id2rewards:
+                                domain_id2rewards[domain_id_key] = []
+                            domain_id2rewards[domain_id_key].append(domain_prompt_score.item())
+
+                        for domain_id_key, rewards in domain_id2rewards.items():
+                            domain = domain_id_key.split("|")[0]
+                            self.prompt_reward_by_step[domain_id_key]["history"].append({
+                                "pass_rate": np.mean(rewards),
+                                "epoch": len(self.prompt_reward_by_step[domain_id_key]["history"]),
+                                "global_step": global_step
+                            })
+                            self.num_prompts[domain] += 1
+
                     generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
                     generate_output.meta_info.pop("is_offload_states", None)
 
@@ -524,6 +626,7 @@ class RLVRPipeline(BasePipeline):
 
                 logger.info(f"pipeline step {global_step} finished")
                 global_step += 1
+                ep_step_accum += 1
         logger.info("pipeline complete!")
 
     @torch.no_grad()
